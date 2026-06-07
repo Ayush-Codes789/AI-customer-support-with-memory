@@ -1,3 +1,7 @@
-streamlit 
-openai
-mem0ai==0.1.29
+streamlit>=1.35.0
+openai>=1.30.0
+mem0ai>=0.1.10
+langchain-core>=0.2.0
+langchain-openai>=0.1.0
+langgraph>=0.0.50
+pydantic>=2.0.0
