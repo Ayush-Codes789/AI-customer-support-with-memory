@@ -1,13 +1,22 @@
 import streamlit as st
-from openai import OpenAI
-from mem0 import Memory
 import os
 import json
 from datetime import datetime, timedelta
+from openai import OpenAI
+from mem0 import Memory
+
+# --- LangGraph & LangChain Imports ---
+from typing import Annotated, TypedDict
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import StructuredTool
+from langgraph.graph import StateGraph, START, END
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode
 
 # Set up the Streamlit App
 st.title("AI Customer Support Agent with Memory 🛒")
-st.caption("Chat with a customer support assistant who remembers your past interactions.")
+st.caption("Chat with a highly capable LangGraph agent that autonomously searches your past interactions.")
 
 # Set the OpenAI API key
 openai_api_key = st.text_input("Enter OpenAI API Key", type="password")
@@ -16,8 +25,8 @@ if openai_api_key:
     os.environ['OPENAI_API_KEY'] = openai_api_key
 
     class CustomerSupportAIAgent:
-        def __init__(self):
-            # Initialize Mem0 with Qdrant as the vector store
+        def __init__(self, api_key):
+            # 1. Initialize Mem0 with Qdrant as the vector store
             config = {
                 "vector_store": {
                     "provider": "qdrant",
@@ -31,35 +40,95 @@ if openai_api_key:
                 self.memory = Memory.from_config(config)
             except Exception as e:
                 st.error(f"Failed to initialize memory: {e}")
-                st.stop()  # Stop execution if memory initialization fails
+                st.stop() 
 
-            self.client = OpenAI()
+            # 2. Initialize standard OpenAI client for data generation
+            self.client = OpenAI(api_key=api_key)
             self.app_id = "customer-support"
+
+            # 3. Build the LangGraph Agent workflow
+            self._build_agent_graph(api_key)
+
+        def _build_agent_graph(self, api_key):
+            """Compiles the LangGraph workflow defining the Agent's brain and tools."""
+            
+            # A. Define the Tool the agent can use
+            def search_customer_history(query: str, user_id: str) -> str:
+                """Search the customer's past orders and interactions."""
+                try:
+                    relevant_memories = self.memory.search(query=query, user_id=user_id)
+                    context = ""
+                    if relevant_memories and "results" in relevant_memories:
+                        for mem in relevant_memories["results"]:
+                            if "memory" in mem:
+                                context += f"- {mem['memory']}\n"
+                    return context if context else "No relevant history found in database."
+                except Exception as e:
+                    return f"Error accessing memory: {str(e)}"
+
+            search_tool = StructuredTool.from_function(
+                func=search_customer_history,
+                name="search_customer_history",
+                description="Search the customer's past orders, preferences, and interactions. Always provide the query and user_id."
+            )
+            tools = [search_tool]
+
+            # B. Define the Graph State
+            class AgentState(TypedDict):
+                messages: Annotated[list[BaseMessage], add_messages]
+                user_id: str
+
+            # C. Initialize the LLM and bind the tools to it
+            llm = ChatOpenAI(model="gpt-4", temperature=0, api_key=api_key)
+            llm_with_tools = llm.bind_tools(tools)
+
+            # D. Define the Agent Node
+            def agent_node(state: AgentState):
+                # We inject a system message dynamically with the specific customer ID
+                sys_msg = SystemMessage(
+                    content=f"You are a helpful customer support AI agent for TechGadgets.com. "
+                            f"The current customer's ID is {state['user_id']}. "
+                            f"If you need context about their past orders or issues, use the search_customer_history tool."
+                )
+                messages_to_process = [sys_msg] + state["messages"]
+                response = llm_with_tools.invoke(messages_to_process)
+                return {"messages": [response]}
+
+            # E. Define the Routing Logic
+            def should_continue(state: AgentState):
+                last_message = state["messages"][-1]
+                # If the LLM decided to call a tool, route to the tools node
+                if last_message.tool_calls:
+                    return "tools"
+                # Otherwise, end the execution
+                return END
+
+            # F. Construct and compile the Graph
+            workflow = StateGraph(AgentState)
+            workflow.add_node("agent", agent_node)
+            workflow.add_node("tools", ToolNode(tools))
+
+            workflow.add_edge(START, "agent")
+            workflow.add_conditional_edges("agent", should_continue)
+            workflow.add_edge("tools", "agent")
+
+            self.graph = workflow.compile()
 
         def handle_query(self, query, user_id=None):
             try:
-                # Search for relevant memories
-                relevant_memories = self.memory.search(query=query, user_id=user_id)
+                # 1. Prepare inputs for LangGraph
+                inputs = {
+                    "messages": [HumanMessage(content=query)],
+                    "user_id": user_id
+                }
+
+                # 2. Invoke the autonomous agent graph
+                final_state = self.graph.invoke(inputs)
                 
-                # Build context from relevant memories
-                context = "Relevant past information:\n"
-                if relevant_memories and "results" in relevant_memories:
-                    for memory in relevant_memories["results"]:
-                        if "memory" in memory:
-                            context += f"- {memory['memory']}\n"
+                # 3. Extract final response
+                answer = final_state["messages"][-1].content
 
-                # Generate a response using OpenAI
-                full_prompt = f"{context}\nCustomer: {query}\nSupport Agent:"
-                response = self.client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[
-                        {"role": "system", "content": "You are a customer support AI agent for TechGadgets.com, an online electronics store."},
-                        {"role": "user", "content": full_prompt}
-                    ]
-                )
-                answer = response.choices[0].message.content
-
-                # Add the query and answer to memory
+                # 4. Save the new interaction to Mem0 for future reference
                 self.memory.add(query, user_id=user_id, metadata={"app_id": self.app_id, "role": "user"})
                 self.memory.add(answer, user_id=user_id, metadata={"app_id": self.app_id, "role": "assistant"})
 
@@ -70,7 +139,6 @@ if openai_api_key:
 
         def get_memories(self, user_id=None):
             try:
-                # Retrieve all memories for a user
                 return self.memory.get_all(user_id=user_id)
             except Exception as e:
                 st.error(f"Failed to retrieve memories: {e}")
@@ -103,7 +171,6 @@ if openai_api_key:
 
                 customer_data = json.loads(response.choices[0].message.content)
 
-                # Add generated data to memory
                 for key, value in customer_data.items():
                     if isinstance(value, list):
                         for item in value:
@@ -124,11 +191,11 @@ if openai_api_key:
                 st.error(f"Failed to generate synthetic data: {e}")
                 return None
 
-    # Initialize the CustomerSupportAIAgent
-    support_agent = CustomerSupportAIAgent()
+    # Initialize the Agent
+    support_agent = CustomerSupportAIAgent(openai_api_key)
 
-    # Sidebar for customer ID and memory view
-    st.sidebar.title("Enter your Customer ID:")
+    # --- Sidebar UI ---
+    st.sidebar.title("Customer Context Setup")
     previous_customer_id = st.session_state.get("previous_customer_id", None)
     customer_id = st.sidebar.text_input("Enter your Customer ID")
 
@@ -137,10 +204,9 @@ if openai_api_key:
         st.session_state.previous_customer_id = customer_id
         st.session_state.customer_data = None
 
-    # Add button to generate synthetic data
     if st.sidebar.button("Generate Synthetic Data"):
         if customer_id:
-            with st.spinner("Generating customer data..."):
+            with st.spinner("Generating customer data into Mem0..."):
                 st.session_state.customer_data = support_agent.generate_synthetic_data(customer_id)
             if st.session_state.customer_data:
                 st.sidebar.success("Synthetic data generated successfully!")
@@ -163,41 +229,36 @@ if openai_api_key:
                 if memories and "results" in memories:
                     for memory in memories["results"]:
                         if "memory" in memory:
-                            st.write(f"- {memory['memory']}")
+                            st.sidebar.write(f"- {memory['memory']}")
             else:
                 st.sidebar.info("No memory found for this customer ID.")
         else:
             st.sidebar.error("Please enter a customer ID to view memory info.")
 
-    # Initialize the chat history
+    # --- Main Chat UI ---
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # Display the chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
-    # Accept user input
     query = st.chat_input("How can I assist you today?")
 
     if query and customer_id:
-        # Add user message to chat history
         st.session_state.messages.append({"role": "user", "content": query})
         with st.chat_message("user"):
             st.markdown(query)
 
-        # Generate and display response
-        with st.spinner("Generating response..."):
+        with st.spinner("Agent is thinking (and searching memory if needed)..."):
             answer = support_agent.handle_query(query, user_id=customer_id)
 
-        # Add assistant response to chat history
         st.session_state.messages.append({"role": "assistant", "content": answer})
         with st.chat_message("assistant"):
             st.markdown(answer)
 
     elif not customer_id:
-        st.error("Please enter a customer ID to start the chat.")
+        st.info("Please enter a Customer ID in the sidebar to start chatting.")
 
 else:
-    st.warning("Please enter your OpenAI API key to use the customer support agent.")
+    st.warning("Please enter your OpenAI API key to start the application.")
